@@ -786,66 +786,19 @@ impl VirtioPciDevice {
         self.set_notification_ioevents(vm, self.bar_address, false)
     }
 
-    /// Tear down the MSI-X configuration. Used on device reset.
+    /// Reset the virtio MSI-X vector assignments. Used on device reset.
+    ///
+    /// The MSI-X capability and table are PCI state, not virtio device state, and are left
+    /// untouched: a driver may reset the device and only reassign the virtio vectors afterwards.
     fn reset_msix(&mut self) {
-        let (num_vectors, vm) = {
-            let msix_config = self.msix_config.lock().expect("Poisoned lock");
-            (
-                msix_config.vectors.num_vectors(),
-                msix_config.vectors.vm.clone(),
-            )
-        };
-
-        // Build a fresh MSI-X vector group and configuration.
-        let msix_vectors = match KvmVm::create_msix_group(vm.clone(), num_vectors) {
-            Ok(vectors) => Arc::new(vectors),
-            Err(err) => {
-                error!("Failed to recreate MSI-X vector group on reset: {err:?}");
-                return;
-            }
-        };
-
         self.common_config
             .msix_config
             .store(VIRTQ_MSI_NO_VECTOR, Ordering::Release);
-        for vector in self
-            .common_config
+        self.common_config
             .msix_queues
             .lock()
             .expect("Poisoned lock")
-            .iter_mut()
-        {
-            *vector = VIRTQ_MSI_NO_VECTOR;
-        }
-
-        let msix_config = Arc::new(Mutex::new(MsixConfig::new(msix_vectors.clone(), self.sbdf)));
-        let interrupt = Arc::new(VirtioInterruptMsix::new(
-            msix_config.clone(),
-            self.common_config.msix_config.clone(),
-            self.common_config.msix_queues.clone(),
-            msix_vectors,
-        ));
-
-        // Dropping the previous virtio_interrupt and msix_config releases the
-        // last references to the old MsixVectorGroup, whose Drop unregisters
-        // the irqfds, removes the GSI routes from the routing table and frees
-        // the GSIs.
-        self.virtio_interrupt = Some(interrupt);
-        self.msix_config = msix_config;
-
-        // Flush the updated routing table
-        if let Err(err) = vm.set_gsi_routes() {
-            error!("Failed to update GSI routes after MSI-X reset: {err:?}");
-        }
-
-        // Clear the MSI-X Enable and Function Mask bits in the guest-visible
-        // PCI capability so config-space reads stay consistent with the
-        // freshly-reset MsixConfig.
-        let reg_idx = self.msix_config_cap_offset / 4;
-        let msg_ctl = (self.configuration.read_reg(reg_idx) >> 16) as u16;
-        let msg_ctl = msg_ctl & !((1 << 15) | (1 << 14)); // clear Enable + Function Mask
-        self.configuration
-            .write_config_register(reg_idx, 2, &msg_ctl.to_le_bytes());
+            .fill(VIRTQ_MSI_NO_VECTOR);
     }
 
     pub fn state(&self) -> VirtioPciDeviceState {
@@ -1243,8 +1196,9 @@ mod tests {
     use crate::devices::virtio::transport::pci::device::{
         CAPABILITY_BAR_SIZE, COMMAND_MEMORY_SPACE_ENABLE, COMMAND_REG, COMMON_CONFIG_BAR_OFFSET,
         COMMON_CONFIG_SIZE, DEVICE_CONFIG_BAR_OFFSET, DEVICE_CONFIG_SIZE, ISR_CONFIG_BAR_OFFSET,
-        ISR_CONFIG_SIZE, NOTIFICATION_BAR_OFFSET, NOTIFICATION_SIZE, NOTIFY_OFF_MULTIPLIER,
-        PciVirtioSubclass, VirtioPciCap, VirtioPciCfgCap, VirtioPciNotifyCap,
+        ISR_CONFIG_SIZE, MSIX_TABLE_BAR_OFFSET, NOTIFICATION_BAR_OFFSET, NOTIFICATION_SIZE,
+        NOTIFY_OFF_MULTIPLIER, PciVirtioSubclass, VIRTQ_MSI_NO_VECTOR, VirtioPciCap,
+        VirtioPciCfgCap, VirtioPciNotifyCap,
     };
     use crate::devices::virtio::transport::pci::device_status::{
         ACKNOWLEDGE, DRIVER, DRIVER_OK, FEATURES_OK,
@@ -2071,5 +2025,59 @@ mod tests {
         setup_queues(&mut locked);
         write_driver_status(&mut locked, ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK);
         assert!(locked.device_activated.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_reset_keeps_msix_state() {
+        let vmm = create_vmm_with_virtio_pci_device();
+        let device = get_virtio_device(&vmm);
+        let mut locked = device.lock().unwrap();
+
+        // Program MSI-X table entry 0 and enable MSI-X.
+        let entry = u64::from(MSIX_TABLE_BAR_OFFSET);
+        locked.write_bar(0, entry, &0xfee0_0000u32.to_le_bytes());
+        locked.write_bar(0, entry + 4, &0u32.to_le_bytes());
+        locked.write_bar(0, entry + 8, &0x41u32.to_le_bytes());
+        locked.write_bar(0, entry + 12, &0u32.to_le_bytes());
+        let cap_offset = locked.msix_config_cap_offset;
+        locked.write_config_register(cap_offset / 4, 2, &(1u16 << 15).to_le_bytes());
+        assert!(locked.msix_config.lock().unwrap().enabled);
+
+        write_driver_status(&mut locked, ACKNOWLEDGE);
+        write_driver_status(&mut locked, ACKNOWLEDGE | DRIVER);
+        let features = read_device_features(&mut locked);
+        write_driver_features(&mut locked, features);
+        write_driver_status(&mut locked, ACKNOWLEDGE | DRIVER | FEATURES_OK);
+        setup_queues(&mut locked);
+        locked.common_config.msix_config.store(0, Ordering::Release);
+        locked.common_config.msix_queues.lock().unwrap().fill(0);
+        write_driver_status(&mut locked, ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK);
+        assert!(locked.device_activated.load(Ordering::SeqCst));
+
+        write_driver_status(&mut locked, 0);
+        assert!(!locked.device_activated.load(Ordering::SeqCst));
+
+        assert_eq!(
+            locked.common_config.msix_config.load(Ordering::Acquire),
+            VIRTQ_MSI_NO_VECTOR
+        );
+        assert!(
+            locked
+                .common_config
+                .msix_queues
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|&v| v == VIRTQ_MSI_NO_VECTOR)
+        );
+
+        // MSI-X stays enabled and the table entry is preserved.
+        let msg_ctl = locked.read_config_register(cap_offset / 4) >> 16;
+        assert_ne!(msg_ctl & (1 << 15), 0);
+        let msix_config = locked.msix_config.lock().unwrap();
+        assert!(msix_config.enabled);
+        assert_eq!(msix_config.table_entries[0].msg_addr_lo, 0xfee0_0000);
+        assert_eq!(msix_config.table_entries[0].msg_data, 0x41);
+        assert!(!msix_config.table_entries[0].masked());
     }
 }
